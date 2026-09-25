@@ -38,6 +38,39 @@ def get_project_folder() -> Path:
     return claude_projects / mangled
 
 
+def get_candidate_folders() -> List[Tuple[Path, Optional[str]]]:
+    """Return (folder, cwd_filter) pairs to read sessions from.
+
+    The primary folder (exact cwd match) needs no filter.  Parent project
+    folders are included only when they exist and their mangled name is a
+    prefix of ours — those sessions must be filtered to cwd == our cwd so
+    we don't count work done elsewhere in the parent project.
+    """
+    cwd = os.getcwd()
+    mangled = cwd.replace("/", "-").replace("_", "-").replace(".", "-")
+    claude_projects = Path.home() / ".claude" / "projects"
+    exact = claude_projects / mangled
+
+    results: List[Tuple[Path, Optional[str]]] = []
+
+    # Always include the exact folder (no cwd filter needed — every session
+    # in this folder was started from this directory).
+    if exact.exists():
+        results.append((exact, None))
+
+    # Walk up the real filesystem path and add any ancestor project folders
+    # that exist in ~/.claude/projects/.  Filter their sessions to our cwd.
+    p = Path(cwd).parent
+    while str(p) != p.root:
+        parent_mangled = str(p).replace("/", "-").replace("_", "-").replace(".", "-")
+        parent_folder = claude_projects / parent_mangled
+        if parent_folder.exists() and parent_folder != exact:
+            results.append((parent_folder, cwd))
+        p = p.parent
+
+    return results
+
+
 def new_stats() -> Dict[str, Any]:
     """Create a fresh stats dict."""
     return {
@@ -154,16 +187,31 @@ def format_millions(n: int) -> str:
 # SESSION PARSING
 # =============================================================================
 
-def parse_session_file(filepath: Path) -> Tuple[str, Dict]:
-    """Parse a JSONL session file and extract token usage and branch."""
+def parse_session_file(filepath: Path, cwd_filter: Optional[str] = None) -> Tuple[str, Dict]:
+    """Parse a JSONL session file and extract token usage and branch.
+
+    If cwd_filter is given, only count turns where the message's cwd field
+    starts with cwd_filter (used when reading from a parent project folder).
+    Sessions with no cwd field at all are included unconditionally.
+    """
     stats = new_stats()
     branch = None
+    # Determine the session-level cwd from the first message that has one.
+    session_cwd: Optional[str] = None
 
     try:
         with open(filepath, "r") as f:
             for line in f:
                 try:
                     data = json.loads(line.strip())
+
+                    if session_cwd is None and "cwd" in data:
+                        session_cwd = data["cwd"]
+
+                    # When filtering by cwd, skip this session entirely if the
+                    # session-level cwd is known and doesn't match.
+                    if cwd_filter and session_cwd and not session_cwd.startswith(cwd_filter):
+                        return "(unknown)", new_stats()
 
                     # Extract branch (from user or assistant messages)
                     if branch is None and "gitBranch" in data:
@@ -215,22 +263,25 @@ def parse_session_file(filepath: Path) -> Tuple[str, Dict]:
 
 def collect_all_stats() -> Tuple[Dict[str, Dict], Dict, List]:
     """Collect stats from all session files."""
-    project_folder = get_project_folder()
+    candidates = get_candidate_folders()
 
-    if not project_folder.exists():
+    if not candidates:
         return {}, new_stats(), []
 
-    session_files = list(project_folder.glob("*.jsonl"))
+    all_session_files: List[Tuple[Path, Optional[str]]] = []
+    for folder, cwd_filter in candidates:
+        for sf in folder.glob("*.jsonl"):
+            all_session_files.append((sf, cwd_filter))
 
-    if not session_files:
+    if not all_session_files:
         return {}, new_stats(), []
 
     # Group by branch
     branch_stats = defaultdict(new_stats)
     session_details = []
 
-    for sf in sorted(session_files, key=lambda x: x.stat().st_mtime):
-        branch, stats = parse_session_file(sf)
+    for sf, cwd_filter in sorted(all_session_files, key=lambda x: x[0].stat().st_mtime):
+        branch, stats = parse_session_file(sf, cwd_filter)
         merge_stats(branch_stats[branch], stats)
         if stats["message_count"] > 0:
             session_details.append((sf.stem, branch, stats))
@@ -247,16 +298,19 @@ def collect_all_stats() -> Tuple[Dict[str, Dict], Dict, List]:
 # DETAILED PARSING (per-message events for hourly / per-session analysis)
 # =============================================================================
 
-def parse_session_detailed(filepath: Path) -> Tuple[str, List[Dict[str, Any]]]:
+def parse_session_detailed(filepath: Path, cwd_filter: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """Parse a session JSONL and return (branch, list_of_events).
 
     Emits one event per assistant message (so tokens are always fully accumulated),
     but sets is_new_turn=True only on the first assistant message after a user text
     prompt — not on tool-result continuations.
+
+    If cwd_filter is given, sessions whose cwd doesn't start with it return no events.
     """
     branch: Optional[str] = None
     events: List[Dict[str, Any]] = []
     next_is_new_turn: bool = False  # set True after a user text message
+    session_cwd: Optional[str] = None
 
     try:
         with open(filepath, "r") as f:
@@ -265,6 +319,11 @@ def parse_session_detailed(filepath: Path) -> Tuple[str, List[Dict[str, Any]]]:
                     data = json.loads(line.strip())
                 except json.JSONDecodeError:
                     continue
+
+                if session_cwd is None and "cwd" in data:
+                    session_cwd = data["cwd"]
+                    if cwd_filter and not session_cwd.startswith(cwd_filter):
+                        return "(unknown)", []
 
                 if branch is None and "gitBranch" in data:
                     branch = data["gitBranch"]
@@ -367,7 +426,7 @@ def collect_detailed_stats() -> Dict[str, Any]:
           "first_ts":  iso, "last_ts": iso,
         }
     """
-    project_folder = get_project_folder()
+    candidates = get_candidate_folders()
     sessions_out: List[Dict[str, Any]] = []
     hours: Dict[str, Dict[str, Any]] = defaultdict(_empty_bucket)
     branches: Dict[str, Dict[str, Any]] = defaultdict(_empty_bucket)
@@ -376,14 +435,19 @@ def collect_detailed_stats() -> Dict[str, Any]:
     first_ts: Optional[str] = None
     last_ts: Optional[str] = None
 
-    if not project_folder.exists():
+    if not candidates:
         return {
             "sessions": [], "hours": {}, "branches": {}, "models": {},
             "total": total, "first_ts": None, "last_ts": None,
         }
 
-    for sf in sorted(project_folder.glob("*.jsonl"), key=lambda x: x.stat().st_mtime):
-        branch, events = parse_session_detailed(sf)
+    all_session_files: List[Tuple[Path, Optional[str]]] = []
+    for folder, cwd_filter in candidates:
+        for sf in folder.glob("*.jsonl"):
+            all_session_files.append((sf, cwd_filter))
+
+    for sf, cwd_filter in sorted(all_session_files, key=lambda x: x[0].stat().st_mtime):
+        branch, events = parse_session_detailed(sf, cwd_filter)
         if not events:
             continue
 

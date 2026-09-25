@@ -11,6 +11,7 @@ Features:
 - HTML report generation with visual charts
 """
 
+import re
 import json
 import os
 import sys
@@ -113,26 +114,84 @@ def total_tokens(stats: Dict) -> int:
     )
 
 
-# Pricing per 1M tokens (as of 2025). Cache read ~10% of input; cache create 1h ~125%.
+# ---------------------------------------------------------------------------
+# Pricing
+# ---------------------------------------------------------------------------
+# Rates are USD per 1M tokens, Anthropic first-party API list price.
+# Verified against the Anthropic model catalog on 2026-09-25.
+#
+# Derived rates follow the published multipliers:
+#   cache_read   = 0.1x input   (except Fable 5.1, which is 0.025x -> $0.25/1M)
+#   cache_create = 1.25x input  (5-minute TTL, the Claude Code default;
+#                                a 1-hour TTL would be 2x)
+#
+# Pricing is keyed on a MODEL TIER, not a bare family name. A substring match
+# on "opus" is no longer sufficient: Opus 4.1 was $15/$75 while Opus 4.5 and
+# later are $5/$25, and Sonnet 5 ($2/$10) is priced below Sonnet 4.6 ($3/$15).
+# All 1M-context models above are billed at these standard rates -- there is
+# no long-context premium tier.
 PRICING = {
-    "opus":   {"input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_create": 18.75},
-    "sonnet": {"input":  3.00, "output": 15.00, "cache_read": 0.30,  "cache_create":  3.75},
-    "haiku":  {"input":  0.80, "output":  4.00, "cache_read": 0.08,  "cache_create":  1.00},
+    # Fable / Mythos 5.x -- the most capable tier.
+    # Fable 5.1 cache reads are 0.025x input, a quarter of Fable 5's.
+    "fable-5-1":  {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_create": 12.50},
+    "fable":      {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_create": 12.50},
+
+    # Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 -- all $5/$25.
+    "opus":       {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_create":  6.25},
+    # Opus 4.1 / 4.0 and older were priced at the legacy $15/$75.
+    "opus-4-1":   {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_create": 18.75},
+
+    # Sonnet 5 is cheaper than the 4.x Sonnets it replaces.
+    "sonnet":     {"input":  2.00, "output": 10.00, "cache_read": 0.20, "cache_create":  2.50},
+    "sonnet-4":   {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_create":  3.75},
+
+    "haiku":      {"input":  1.00, "output":  5.00, "cache_read": 0.10, "cache_create":  1.25},
+    # Haiku 3.5 / 3 -- retired or deprecated, but may appear in old transcripts.
+    "haiku-3":    {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_create":  1.00},
 }
+
+# Human-readable label per pricing tier, for reports.
+TIER_LABELS = {
+    "fable-5-1": "fable 5.1",
+    "fable":     "fable 5",
+    "opus":      "opus 5/4.x",
+    "opus-4-1":  "opus 4.1 (legacy)",
+    "sonnet":    "sonnet 5",
+    "sonnet-4":  "sonnet 4.x",
+    "haiku":     "haiku 4.5",
+    "haiku-3":   "haiku 3.x",
+}
+
 DEFAULT_MODEL_FAMILY = "opus"
 
 
 def model_family(model: Optional[str]) -> str:
-    """Map a model id like 'claude-opus-4-6' to a pricing family."""
+    """Map a model id like 'claude-opus-5[1m]' to a pricing tier.
+
+    Claude Code writes ids such as 'claude-opus-5', 'claude-fable-5-1',
+    'claude-haiku-4-5-20251001' and long-context variants suffixed '[1m]'.
+    The suffix does not change the rate, so it is stripped before matching.
+    """
     if not model:
         return DEFAULT_MODEL_FAMILY
     m = model.lower()
+    # Drop a long-context marker ('claude-opus-5[1m]') and any date stamp.
+    m = re.sub(r"\[[^\]]*\]$", "", m)
+
+    if "fable" in m or "mythos" in m:
+        # Fable/Mythos 5.1 get the cheaper 0.025x cache-read rate.
+        return "fable-5-1" if re.search(r"5[-.]1", m) else "fable"
     if "opus" in m:
-        return "opus"
+        # Opus 4.1 and 4.0 are the only Opus models still on the legacy rate.
+        return "opus-4-1" if re.search(r"opus-4([-.][01])?(-\d{8})?$", m) else "opus"
     if "sonnet" in m:
-        return "sonnet"
+        # Sonnet 4.x and older keep the legacy rate; Sonnet 5+ (and a bare
+        # "sonnet", which always means the current model) use the new one.
+        return "sonnet-4" if re.search(r"sonnet-[1-4]\b|-[1-4][-.]\d*-?sonnet", m) else "sonnet"
     if "haiku" in m:
-        return "haiku"
+        # Haiku 3.x wrote the version BEFORE the name ('claude-3-5-haiku-...'),
+        # so match that shape as well as the modern 'haiku-4-5' ordering.
+        return "haiku-3" if re.search(r"haiku-[1-3]\b|-[1-3][-.]\d*-?haiku", m) else "haiku"
     return DEFAULT_MODEL_FAMILY
 
 
@@ -1095,7 +1154,7 @@ def _render_verbose_html(detailed: Dict[str, Any]) -> str:
         cost_per_turn = b['cost_usd'] / b['message_count'] if b['message_count'] > 0 else 0
         model_rows.append(f"""
             <tr>
-                <td><code>{fam}</code></td>
+                <td><code>{TIER_LABELS.get(fam, fam)}</code></td>
                 <td class="num">{b['message_count']:,}</td>
                 <td class="num">{b['input_tokens']:,}</td>
                 <td class="num">{b['output_tokens']:,}</td>
@@ -1258,7 +1317,8 @@ def _render_verbose_html(detailed: Dict[str, Any]) -> str:
 
     <footer>
         Generated by <strong>cc-usage --verbose-report</strong>.
-        Costs are Anthropic API equivalents (Opus: $15/$75 per 1M in/out; Sonnet: $3/$15; Haiku: $0.80/$4).
+        Costs are Anthropic API equivalents, per 1M input/output tokens:
+        Fable 5.x $10/$50 &middot; Opus 5 &amp; 4.5&ndash;4.8 $5/$25 &middot; Sonnet 5 $2/$10 &middot; Haiku 4.5 $1/$5.
         Subscription users pay flat monthly fees instead of per-token.
     </footer>
 
@@ -1488,13 +1548,13 @@ def print_text_report(branch_stats: Dict, grand_total: Dict, session_details: Li
     print("\n" + "=" * 125)
     print("TOKEN BREAKDOWN BY MODEL FAMILY")
     print("-" * 125)
-    print(f"{'Model':<15} {'Input':>12} {'Output':>12} {'Cache Read':>14} {'Cache Create':>14} {'Turns':>8} {'$/Turn':>10} {'Cost':>12}")
+    print(f"{'Model':<18} {'Input':>12} {'Output':>12} {'Cache Read':>14} {'Cache Create':>14} {'Turns':>8} {'$/Turn':>10} {'Cost':>12}")
     print("-" * 125)
     for fam in sorted(detailed["models"].keys()):
         b = detailed["models"][fam]
         cost_per_turn = b['cost_usd'] / b['message_count'] if b['message_count'] > 0 else 0
         print(
-            f"{fam:<15} "
+            f"{TIER_LABELS.get(fam, fam):<18} "
             f"{format_number(b['input_tokens']):>12} "
             f"{format_number(b['output_tokens']):>12} "
             f"{format_number(b['cache_read_input_tokens']):>14} "
@@ -1505,7 +1565,7 @@ def print_text_report(branch_stats: Dict, grand_total: Dict, session_details: Li
         )
     print("-" * 125)
     total_cost_per_turn = detailed['total']['cost_usd'] / detailed['total']['message_count'] if detailed['total']['message_count'] > 0 else 0
-    print(f"{'TOTAL':<15} "
+    print(f"{'TOTAL':<18} "
           f"{format_number(grand_total['input_tokens']):>12} "
           f"{format_number(grand_total['output_tokens']):>12} "
           f"{format_number(grand_total['cache_read_input_tokens']):>14} "
@@ -1515,8 +1575,9 @@ def print_text_report(branch_stats: Dict, grand_total: Dict, session_details: Li
           f"${detailed['total']['cost_usd']:>10,.2f}")
 
     print("\n" + "=" * 90)
-    print("Note: Cost calculated per-model at actual Anthropic API rates:")
-    print("      Opus: $15/$75 input/output per 1M | Sonnet: $3/$15 | Haiku: $0.80/$4")
+    print("Note: Cost calculated per-model at actual Anthropic API rates,")
+    print("      per 1M input/output tokens:")
+    print("      Fable 5.x: $10/$50 | Opus 5 & 4.5-4.8: $5/$25 | Sonnet 5: $2/$10 | Haiku 4.5: $1/$5")
     print("      Subscription users (Pro $20/mo, Max $100/mo) pay flat fees instead.")
 
     # Verbose: hourly + per-session + per-model breakdown with costs
@@ -1534,7 +1595,7 @@ def print_verbose_sections(detailed: Dict[str, Any]) -> None:
     print("USAGE BY MODEL FAMILY")
     print("-" * width)
     print(
-        f"{'Model':<10} {'Turns':>7} {'Input':>12} {'Output':>12} "
+        f"{'Model':<18} {'Turns':>7} {'Input':>12} {'Output':>12} "
         f"{'CacheRead':>14} {'CacheCreate':>14} {'Tokens':>12} {'Cost':>12} {'$/Turn':>10}"
     )
     print("-" * width)
@@ -1542,7 +1603,7 @@ def print_verbose_sections(detailed: Dict[str, Any]) -> None:
         b = detailed["models"][fam]
         cost_per_turn = b['cost_usd'] / b['message_count'] if b['message_count'] > 0 else 0
         print(
-            f"{fam:<10} {b['message_count']:>7} "
+            f"{TIER_LABELS.get(fam, fam):<18} {b['message_count']:>7} "
             f"{format_number(b['input_tokens']):>12} "
             f"{format_number(b['output_tokens']):>12} "
             f"{format_number(b['cache_read_input_tokens']):>14} "

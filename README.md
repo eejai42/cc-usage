@@ -7,7 +7,7 @@ Claude Code stores session transcripts as JSONL files under `~/.claude/projects/
 ## Features
 
 - **Per-branch usage** — see how many tokens each git branch has cost
-- **Per-model cost** — Opus, Sonnet, and Haiku are priced differently; costs are calculated accurately per model
+- **Per-model cost** — Fable, Opus, Sonnet, and Haiku are priced differently, and rates differ *within* a family by generation; costs are calculated per model tier
 - **Verbose breakdown** — hourly buckets and per-session detail via `-v`
 - **HTML reports** — dark-themed dashboard with stacked bar charts and cumulative token graphs
 - **Pre-commit hook** — snapshot token usage with every commit, building a timeline over the life of a project
@@ -91,12 +91,32 @@ This renames the JSONL transcripts into an archived sibling directory under `~/.
 
 ## Token Types and Pricing
 
-| Type | What it is | Opus 4 | Sonnet 4 | Haiku 4 |
-|------|-----------|--------|----------|---------|
-| Input | Prompt tokens sent to the model | $15/1M | $3/1M | $0.80/1M |
-| Output | Tokens the model generates | $75/1M | $15/1M | $4/1M |
-| Cache Read | Tokens served from the prompt cache | $1.50/1M | $0.30/1M | $0.08/1M |
-| Cache Creation | Tokens written into the prompt cache | $18.75/1M | $3.75/1M | $1/1M |
+Rates are Anthropic first-party API list prices per 1M tokens, verified against the
+Anthropic model catalog on **2026-09-25**.
+
+| Model tier | Input | Output | Cache Read | Cache Create |
+|---|---|---|---|---|
+| **Fable 5.1** (`claude-fable-5-1`, `claude-mythos-5-1`) | $10 | $50 | $0.25 | $12.50 |
+| **Fable 5** (`claude-fable-5`, `claude-mythos-5`) | $10 | $50 | $1.00 | $12.50 |
+| **Opus 5 / 4.8 / 4.7 / 4.6 / 4.5** | $5 | $25 | $0.50 | $6.25 |
+| **Opus 4.1 / 4.0** (legacy) | $15 | $75 | $1.50 | $18.75 |
+| **Sonnet 5** | $2 | $10 | $0.20 | $2.50 |
+| **Sonnet 4.6 / 4.5 / 4** | $3 | $15 | $0.30 | $3.75 |
+| **Haiku 4.5** | $1 | $5 | $0.10 | $1.25 |
+| **Haiku 3.5 / 3** (retired) | $0.80 | $4 | $0.08 | $1.00 |
+
+| Type | What it is |
+|------|-----------|
+| Input | Prompt tokens sent to the model |
+| Output | Tokens the model generates |
+| Cache Read | Tokens served from the prompt cache — 0.1x input (0.025x on Fable 5.1) |
+| Cache Creation | Tokens written into the prompt cache — 1.25x input (5-minute TTL) |
+
+**Pricing is keyed on a model *tier*, not a bare family name.** A substring match on
+`opus` is no longer sufficient: Opus 4.1 was $15/$75 while Opus 4.5 and later are
+$5/$25, and Sonnet 5 ($2/$10) is priced *below* the Sonnet 4.x it replaces. The
+`[1m]` long-context suffix (`claude-opus-5[1m]`) is stripped before matching —
+1M-context models bill at the standard rates, with no long-context premium.
 
 > **Note:** Claude Code subscription users (Pro $20/mo, Max $100/mo) pay flat monthly fees rather than per-token rates. The costs shown by `cc-usage` are the *API-equivalent value* — useful for understanding consumption, not for reconciling a bill.
 
@@ -138,7 +158,7 @@ cc-usage --json
       "cache_creation": 50000,
       "total": 980000
     },
-    "cost_by_model": { "opus": 7.20, "sonnet": 1.55 },
+    "cost_by_model": { "opus": 7.20, "sonnet": 1.55, "fable-5-1": 0.00 },
     "total_cost_usd": 8.75,
     "cost_per_turn": 0.2083
   }
